@@ -241,10 +241,19 @@ struct FusedNormRopeKernel {
     };
     const auto num_blocks = div_ceil(num_compress_tokens, kNumWarps);
     using KernelType = std::decay_t<decltype(fused_norm_rope<DType, kHeadDim, kRopeDim, CompressExtend, kUsePDL>)>;
+    // yiqiliu2 / 2026-05-07: nvcc rejects C99 designated initializers as
+    // "nonstandard in C++". Slot order matches the enum (CompressExtend=0,
+    // CompressDecode=1, DefaultForward=2 per ForwardMode at line 35-38),
+    // so a positional initializer is equivalent.
+    static_assert(static_cast<int>(CompressExtend) == 0 &&
+                      static_cast<int>(CompressDecode) == 1 &&
+                      static_cast<int>(DefaultForward) == 2,
+                  "ForwardMode enum order changed; positional kernel_table "
+                  "init below must be reordered to match.");
     static constexpr KernelType kernel_table[3] = {
-        [static_cast<int>(CompressExtend)] = fused_kernel<CompressExtend>,
-        [static_cast<int>(CompressDecode)] = fused_kernel<CompressDecode>,
-        [static_cast<int>(DefaultForward)] = fused_kernel<DefaultForward>,
+        fused_kernel<CompressExtend>,
+        fused_kernel<CompressDecode>,
+        fused_kernel<DefaultForward>,
     };
     const auto kernel = kernel_table[static_cast<int>(mode)];
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
