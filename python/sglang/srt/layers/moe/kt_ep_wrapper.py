@@ -1858,7 +1858,10 @@ def create_kt_config_from_server_args(
     )
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+# NOTE: @torch.compile removed because dynamo crashes during compile on
+# WSL2 + RTX 4090 + V4-Flash during prefill (SIGSEGV inside compile_wrapper).
+# The function is two tensor ops; eager mode is fine.
+# Origin: yiqiliu2 / WSL2 single-card V4-Flash bring-up, 2026-05-07.
 def mask_and_remap_expert_ids(
     topk_ids: torch.Tensor,
     gpu_experts_mask: torch.Tensor,

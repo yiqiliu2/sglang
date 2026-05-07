@@ -1527,11 +1527,14 @@ def maybe_torch_compile(*args, **kwargs):
     """
     torch.compile does not work for triton 2.2.0, which is needed in xlm1's jax.
     Therefore, we disable it here.
+
+    yiqiliu2 / 2026-05-07: also disabled on triton 3 because dynamo crashes
+    with SIGSEGV during prefill on WSL2 + RTX 4090 + V4-Flash. Decorated
+    DSv4 forward methods fault inside compile_wrapper. Eager mode is
+    functionally correct; use it everywhere.
     """
 
     def decorator(func):
-        if is_triton_3():
-            return torch.compile(*args, **kwargs)(func)
         return func
 
     return decorator
