@@ -1049,7 +1049,13 @@ def fp8_paged_mqa_logits_kernel(
     assert H % 4 == 0
     assert D == 128
 
-    @tilelang.jit
+    # yiqiliu2 / 2026-05-07: must thread the file-level pass_configs through here.
+    # Without TL_DISABLE_TMA_LOWER + TL_DISABLE_WARP_SPECIALIZED, tilelang's
+    # default codegen emits Hopper TMA / warp-specialised paths that #GP-fault
+    # ("device-side assert triggered") on architectures without TMA hardware
+    # (Ada SM_89, Ampere SM_8x, Volta, Turing). All sister kernels in this
+    # file already use these pass_configs; this one was the only omission.
+    @tilelang.jit(pass_configs=pass_configs)
     def fp8_paged_mqa_logits(
         q: T.Tensor[(N, H, D), FP8],
         kvcache: T.StridedTensor[(C, B, D), (d_0, D, 1), FP8],
@@ -1067,32 +1073,58 @@ def fp8_paged_mqa_logits_kernel(
             T.copy(q[bx, 0, 0], q_smem)
             T.copy(weight[bx, 0], q_s_frag)
 
-            for i in T.Pipelined(T.ceildiv(seq_len, B), num_stages=2):
-                page = page_table[bx, i]
-                k_smem = T.alloc_shared((B, D), FP8)
-                k_s_frag = T.alloc_fragment((B,), FP32)
-                T.copy(kvcache[page, 0, 0], k_smem)
-                T.copy(kvcache_scale[page, 0], k_s_frag)
+            # yiqiliu2 / 2026-05-07: two correctness fixes for V4-Flash on
+            # consumer GPUs (Ada SM_89, validated on RTX 4090; same logic
+            # applies on Ampere SM_8x and any cap without TMA hardware):
+            #
+            #   (a) seq_len==0 guard: in V4-Flash compressed attention, the
+            #       first compress_ratio-1 query positions of a request have
+            #       c4_seq_lens[bx]==0. Without the guard, T.Pipelined with
+            #       trip=0 and num_stages>=1 still issues a prologue read of
+            #       page_table[bx, 0] / kvcache[page, ...]. Guarding writes
+            #       nothing to o[bx, :] (caller allocates with new_empty and
+            #       masks downstream by seq_lens), matching the torch
+            #       reference path's behaviour for seq_len==0.
+            #
+            #   (b) num_stages 2 -> 0: with trip=1 and num_stages=2, the
+            #       2-stage software pipeline prologue prefetches iteration
+            #       i=1's page_table[bx, 1] / kvcache[page, ...]. For the
+            #       very first prefill chunk page_table.shape[1]==1, so
+            #       column 1 is OOB; the resulting illegal load fires
+            #       "CUDALaunch CUDA_ERROR_ASSERT" with grid (N,1,1) at
+            #       block 128. num_stages=0 disables pipelining entirely
+            #       (per tilelang docstring "if num_stages is 0, pipeline
+            #       will not be enabled."); the GEMM is small (B*D=64*128
+            #       fp8 bytes per iter) so the perf cost vs an
+            #       arch-correct prefetch is negligible relative to the
+            #       indexer KV-cache bandwidth.
+            if seq_len > 0:
+                for i in T.Pipelined(T.ceildiv(seq_len, B), num_stages=0):
+                    page = page_table[bx, i]
+                    k_smem = T.alloc_shared((B, D), FP8)
+                    k_s_frag = T.alloc_fragment((B,), FP32)
+                    T.copy(kvcache[page, 0, 0], k_smem)
+                    T.copy(kvcache_scale[page, 0], k_s_frag)
 
-                logits = T.alloc_fragment((B, H), FP32)
-                if not clear_accum:
-                    T.fill(logits, 0.0)
-                T.gemm(
-                    k_smem,
-                    q_smem,
-                    logits,
-                    transpose_A=False,
-                    transpose_B=True,
-                    clear_accum=clear_accum,
-                )
+                    logits = T.alloc_fragment((B, H), FP32)
+                    if not clear_accum:
+                        T.fill(logits, 0.0)
+                    T.gemm(
+                        k_smem,
+                        q_smem,
+                        logits,
+                        transpose_A=False,
+                        transpose_B=True,
+                        clear_accum=clear_accum,
+                    )
 
-                for h, j in T.Parallel(H, B):
-                    logits[j, h] = T.max(logits[j, h], 0.0) * q_s_frag[h]
-                logits_sum = T.alloc_fragment((B,), FP32)
-                T.reduce_sum(logits, logits_sum, dim=1)
-                for j in T.Parallel(B):
-                    logits_sum[j] *= k_s_frag[j]
-                T.copy(logits_sum, o[bx, i * B])
+                    for h, j in T.Parallel(H, B):
+                        logits[j, h] = T.max(logits[j, h], 0.0) * q_s_frag[h]
+                    logits_sum = T.alloc_fragment((B,), FP32)
+                    T.reduce_sum(logits, logits_sum, dim=1)
+                    for j in T.Parallel(B):
+                        logits_sum[j] *= k_s_frag[j]
+                    T.copy(logits_sum, o[bx, i * B])
 
     return fp8_paged_mqa_logits
 
