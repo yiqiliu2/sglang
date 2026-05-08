@@ -590,8 +590,16 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
                 )
             else:
+                # yiqiliu2 / 2026-05-08: ReqToTokenPool reserves slot 0 as a
+                # sentinel (free_slots = list(range(1, size))), and the
+                # runtime checker expects that exactly. So with size=N the
+                # pool has only N-1 usable slots. Pass max_num_reqs + 1 so
+                # the user-visible capacity actually equals max_num_reqs;
+                # otherwise --max-running-requests 1 yields zero usable slots
+                # and `get_num_allocatable_reqs(0) <= 0` makes the scheduler
+                # silently busy-wait forever (see scheduler.py:2074-2081).
                 self.req_to_token_pool = ReqToTokenPool(
-                    size=max_num_reqs,
+                    size=max_num_reqs + 1,
                     max_context_len=self.model_config.context_len
                     + extra_max_context_len,
                     device=self.device,

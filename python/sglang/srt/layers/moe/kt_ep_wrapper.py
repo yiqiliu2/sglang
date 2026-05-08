@@ -73,6 +73,62 @@ logger = logging.getLogger(__name__)
 # Global cache for GPU experts masks (initialized once per session)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
+# yiqiliu2 / 2026-05-08: per-layer wall-time markers. sglang's
+# multiprocessing.spawn strips most env vars on the scheduler subprocess,
+# so we ALSO honour /tmp/kt_debug_decode.flag (file presence enables) as
+# a sentinel. KT_DEBUG_DECODE_TIMING env still works on launcher-side
+# (rank-0 init) for parity.
+def _kt_dbg_check_enabled():
+    if os.environ.get("KT_DEBUG_DECODE_TIMING", "0") == "1":
+        return True
+    return os.path.exists("/tmp/kt_debug_decode.flag")
+
+_KT_DBG_TIMING = _kt_dbg_check_enabled()
+# yiqiliu2 / 2026-05-08: import-time sentinel — if /tmp/kt_dbg.out has a
+# "MODULE_LOADED pid=..." line, the running scheduler's Python *did* import
+# this module. Helps distinguish "debug never fires because never imported"
+# vs "imported but submit/sync never called".
+try:
+    import sys as _imp_sys
+    _imp_pid = __import__("os").getpid()
+    with open("/tmp/kt_dbg.out", "a", buffering=1) as _imp_f:
+        _imp_f.write(f"MODULE_LOADED pid={_imp_pid} _KT_DBG_TIMING={_KT_DBG_TIMING}\n")
+except Exception:
+    pass
+_KT_DBG_EVERY = max(1, int(os.environ.get("KT_DEBUG_DECODE_EVERY", "1")))
+_KT_DBG_LAYERS = set()
+_kt_dbg_layers_env = os.environ.get("KT_DEBUG_DECODE_LAYERS", "0,1,5,20,40,42")
+if _kt_dbg_layers_env:
+    try:
+        _KT_DBG_LAYERS = {int(x) for x in _kt_dbg_layers_env.split(",") if x.strip()}
+    except Exception:
+        _KT_DBG_LAYERS = {0, 1, 5, 20, 40, 42}
+_KT_DBG_CTR = {}  # per layer call counter
+
+
+def _kt_dbg_should_log(layer_idx: int) -> bool:
+    if not _KT_DBG_TIMING:
+        return False
+    if _KT_DBG_LAYERS and layer_idx not in _KT_DBG_LAYERS:
+        return False
+    n = _KT_DBG_CTR.get(layer_idx, 0) + 1
+    _KT_DBG_CTR[layer_idx] = n
+    return (n % _KT_DBG_EVERY) == 1
+
+
+def _kt_dbg(msg: str) -> None:
+    # stderr to bypass logger filters; flush so order is preserved across threads.
+    # Also append to /tmp/kt_dbg.out as a sanity-check sink in case the scheduler
+    # subprocess has its stderr captured differently than we expect.
+    import sys as _sys
+    _sys.stderr.write(msg + "\n")
+    _sys.stderr.flush()
+    try:
+        with open("/tmp/kt_dbg.out", "a", buffering=1) as _f:
+            _f.write(msg + "\n")
+    except Exception:
+        pass
+
 
 def _kt_prefetch_packed_experts(layer_idx: int, topk_ids: torch.Tensor) -> None:
     """Issue MADV_WILLNEED on the packed-blob byte ranges for the routed experts
@@ -2448,12 +2504,30 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # fault — measured 103 MB/s SSD bw on a Gen4 NVMe, ~30× off peak. The
         # kernel handles WILLNEED asynchronously, so this overlaps SSD I/O
         # with the GPU's attn + dense MLP compute on this layer.
-        _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        _do_log = _kt_dbg_should_log(self.kt_config.layer_idx)
+        if _do_log:
+            t_pf0 = time.perf_counter()
+        # yiqiliu2 / 2026-05-08: prefetch hook is DISABLED. py-spy dump caught
+        # the scheduler in `torch.unique(topk_ids).cpu()` inside this function
+        # — a forced GPU→CPU stream synchronization called on every MoE layer
+        # (43×/token). With --disable-cuda-graph in effect, that sync was
+        # serialising decode at roughly 0.24 tok/s. Re-enable only after we
+        # have a non-blocking gating-id pull (e.g. async copy started after
+        # dispatch_output is built, polled later).
+        # _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        if _do_log:
+            t_pf1 = time.perf_counter()
 
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
         )
+        if _do_log:
+            t_sb1 = time.perf_counter()
+            _kt_dbg(
+                f"[KTDBG] L{self.kt_config.layer_idx} submit pf={int((t_pf1-t_pf0)*1e6)}us "
+                f"submit={int((t_sb1-t_pf1)*1e6)}us q={int(topk_ids.numel())}"
+            )
 
     def sync(self, x: torch.Tensor) -> torch.Tensor:
         """Synchronize and retrieve CPU expert computation results.
@@ -2469,10 +2543,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(x)
 
+        _do_log = _kt_dbg_should_log(self.kt_config.layer_idx)
+        if _do_log:
+            t_s0 = time.perf_counter()
         # Wait for CPU computation and retrieve results
-        return self.wrapper.sync_forward(
+        out = self.wrapper.sync_forward(
             x, torch.cuda.current_stream(x.device).cuda_stream
         )
+        if _do_log:
+            t_s1 = time.perf_counter()
+            _kt_dbg(f"[KTDBG] L{self.kt_config.layer_idx} sync_forward={int((t_s1-t_s0)*1e6)}us")
+        return out
 
     def _submit_with_staged_input(
         self,
@@ -2499,7 +2580,19 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # See submit() above — prefetch routed-expert byte ranges before the
         # AMX kernel touches them.
-        _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        _do_log = _kt_dbg_should_log(self.kt_config.layer_idx)
+        if _do_log:
+            t_pf0 = time.perf_counter()
+        # yiqiliu2 / 2026-05-08: prefetch hook is DISABLED. py-spy dump caught
+        # the scheduler in `torch.unique(topk_ids).cpu()` inside this function
+        # — a forced GPU→CPU stream synchronization called on every MoE layer
+        # (43×/token). With --disable-cuda-graph in effect, that sync was
+        # serialising decode at roughly 0.24 tok/s. Re-enable only after we
+        # have a non-blocking gating-id pull (e.g. async copy started after
+        # dispatch_output is built, polled later).
+        # _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        if _do_log:
+            t_pf1 = time.perf_counter()
 
         # Submit forward task using staged buffer
         self.wrapper.submit_forward(
@@ -2508,6 +2601,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             topk_weights,
             torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
         )
+        if _do_log:
+            t_sb1 = time.perf_counter()
+            _kt_dbg(
+                f"[KTDBG] L{self.kt_config.layer_idx} stg-submit pf={int((t_pf1-t_pf0)*1e6)}us "
+                f"submit={int((t_sb1-t_pf1)*1e6)}us q={int(topk_ids.numel())}"
+            )
 
     def _sync_with_staged_input(
         self, staged_hidden_states: torch.Tensor
@@ -2523,10 +2622,17 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank != 0 or self.wrapper is None:
             return torch.zeros_like(staged_hidden_states)
 
-        return self.wrapper.sync_forward(
+        _do_log = _kt_dbg_should_log(self.kt_config.layer_idx)
+        if _do_log:
+            t_s0 = time.perf_counter()
+        out = self.wrapper.sync_forward(
             staged_hidden_states,
             torch.cuda.current_stream(staged_hidden_states.device).cuda_stream,
         )
+        if _do_log:
+            t_s1 = time.perf_counter()
+            _kt_dbg(f"[KTDBG] L{self.kt_config.layer_idx} stg-sync_forward={int((t_s1-t_s0)*1e6)}us")
+        return out
 
     def apply(
         self,
