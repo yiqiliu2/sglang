@@ -107,13 +107,20 @@ _KT_DBG_CTR = {}  # per layer call counter
 
 
 def _kt_dbg_should_log(layer_idx: int) -> bool:
-    if not _KT_DBG_TIMING:
+    # Re-check on every call so toggling /tmp/kt_debug_decode.flag at runtime
+    # works without server restart. The os.path.exists() syscall is ~5us
+    # which is negligible for our 80ms-per-layer baseline.
+    if not _kt_dbg_check_enabled():
         return False
     if _KT_DBG_LAYERS and layer_idx not in _KT_DBG_LAYERS:
         return False
     n = _KT_DBG_CTR.get(layer_idx, 0) + 1
     _KT_DBG_CTR[layer_idx] = n
-    return (n % _KT_DBG_EVERY) == 1
+    # With EVERY=1 we want EVERY call to fire. With EVERY=N we want every
+    # Nth. The original `n % EVERY == 1` form was buggy for EVERY=1 (n%1==0
+    # always, never matches 1). Use `n % EVERY == 0` instead and start the
+    # counter at 1 (so n=1,2,...,N: hit at n=N).
+    return (n % _KT_DBG_EVERY) == 0
 
 
 def _kt_dbg(msg: str) -> None:
@@ -126,6 +133,69 @@ def _kt_dbg(msg: str) -> None:
     try:
         with open("/tmp/kt_dbg.out", "a", buffering=1) as _f:
             _f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+# yiqiliu2 / 2026-05-08: async background pool for prefetch — workers do the
+# .cpu() / .tolist() which would otherwise force a GPU stream sync on the
+# scheduler thread (the bug that previously made decode 0.24 tok/s).
+_KT_PREFETCH_PY_POOL = None
+
+
+def _kt_get_prefetch_py_pool():
+    global _KT_PREFETCH_PY_POOL
+    if _KT_PREFETCH_PY_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _KT_PREFETCH_PY_POOL = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="kt-prefetch-py"
+        )
+    return _KT_PREFETCH_PY_POOL
+
+
+def _kt_prefetch_packed_experts_async(layer_idx: int, topk_ids: torch.Tensor) -> None:
+    """Submit the GPU→CPU copy of topk_ids and the loader.prefetch_experts
+    syscall to a worker thread. The worker calls topk_ids.cpu() which blocks
+    THE WORKER (releasing GIL during the cuda transfer) but does NOT block
+    the scheduler thread. This was the design fix the original 2026-05-07
+    instrumentation needed before the per-layer GPU sync regression made it
+    necessary to disable prefetch entirely.
+    """
+    # Skip during CUDA graph capture — torch.cuda.Event allocation and the
+    # cross-stream sync would invalidate the capture (cudaErrorStreamCaptureInvalidated).
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    try:
+        from kt_kernel.utils.amx import NativeMoEWrapper
+        loader = getattr(NativeMoEWrapper, "_native_loader_instance", None)
+        if loader is None or not hasattr(loader, "prefetch_experts"):
+            return
+        # Record an event on the current stream so the worker can wait for
+        # the gating output to be fully computed before reading topk_ids.
+        # event.synchronize() in the worker blocks the worker, not the host.
+        event = torch.cuda.Event()
+        event.record()
+        gpu_ids = topk_ids.detach()
+        pool = _kt_get_prefetch_py_pool()
+
+        def _do_prefetch():
+            try:
+                event.synchronize()  # wait for GPU stream completion
+                cpu_ids = gpu_ids.cpu()
+                # dedup + filter sentinels
+                ids = sorted({int(x) for x in cpu_ids.flatten().tolist() if int(x) >= 0})
+                if ids:
+                    loader.prefetch_experts(layer_idx, ids)
+            except Exception:
+                pass  # best-effort
+
+        try:
+            pool.submit(_do_prefetch)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -2514,7 +2584,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # serialising decode at roughly 0.24 tok/s. Re-enable only after we
         # have a non-blocking gating-id pull (e.g. async copy started after
         # dispatch_output is built, polled later).
-        # _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        _kt_prefetch_packed_experts_async(self.kt_config.layer_idx, topk_ids)
         if _do_log:
             t_pf1 = time.perf_counter()
 
@@ -2590,7 +2660,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # serialising decode at roughly 0.24 tok/s. Re-enable only after we
         # have a non-blocking gating-id pull (e.g. async copy started after
         # dispatch_output is built, polled later).
-        # _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+        _kt_prefetch_packed_experts_async(self.kt_config.layer_idx, topk_ids)
         if _do_log:
             t_pf1 = time.perf_counter()
 
@@ -2669,8 +2739,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
         num_tokens = int(x.shape[0]) if x.dim() > 0 else 0
+        # yiqiliu2 / 2026-05-08: also honour /tmp/kt_hybrid_timing.flag because
+        # the scheduler subprocess strips most env vars on multiprocessing.spawn.
         _kt_timing = (
-            os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+            (os.environ.get("SGLANG_KT_HYBRID_TIMING") == "1"
+             or os.path.exists("/tmp/kt_hybrid_timing.flag"))
             and self.tp_rank == 0
             and getattr(self.kt_config, "layer_idx", None) in (0, 5, 20, 35)
         )
@@ -2775,17 +2848,23 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _kt_t_after_submit = time.perf_counter()
 
         # Step 2: Prepare GPU computation by masking and remapping expert IDs
-        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices
+        # CPU expert IDs are set to -1; GPU expert IDs are remapped to GPU weight indices.
+        # yiqiliu2 / 2026-05-08: when num_gpu_experts==0 the GPU MoE is bypassed
+        # below (returns torch.zeros_like(x)), so the masked_dispatch_output is
+        # never consumed. Skip the two GPU ops + tuple._replace boilerplate —
+        # py-spy showed this taking 30%+ of decode wall time at 0.24 tok/s.
         topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_and_remap_expert_ids(
-            topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
-        )
-
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
+        if self.num_gpu_experts == 0 or os.environ.get("SGLANG_KT_BYPASS_GPU_MOE") == "1":
+            masked_dispatch_output = dispatch_output  # unused downstream
+        else:
+            masked_topk_ids = mask_and_remap_expert_ids(
+                topk_ids, self.gpu_experts_mask_cuda, self.logical_to_gpu_index_cuda
+            )
+            # Create modified dispatch output for GPU computation
+            masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+            masked_dispatch_output = dispatch_output._replace(
+                topk_output=masked_topk_output
+            )
         if _kt_timing:
             if os.environ.get("SGLANG_KT_HYBRID_TIMING_DEEP") == "1":
                 torch.cuda.synchronize(x.device)
@@ -2896,7 +2975,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             _cls._kt_layer_step[_li] = _cls._kt_layer_step.get(_li, 0) + 1
             _step = _cls._kt_layer_step[_li]
             if _step <= 16 or _step % 16 == 0:
-                logger.debug(
+                # yiqiliu2 / 2026-05-08: bumped to INFO so it shows up at
+                # default log level. Gated by SGLANG_KT_HYBRID_TIMING/flag-file
+                # so it's only on during debugging.
+                logger.info(
                     "[kt-time] layer=%s step=%d total=%.2fms submit=%.2f "
                     "mask=%.2f gpu=%.2f sync=%.2f merge=%.2f "
                     "cpu_wait=%.2fms num_tokens=%d",
