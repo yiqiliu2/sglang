@@ -1876,6 +1876,16 @@ def _init_kt_gpu_experts_masks(server_args: "ServerArgs") -> Optional[torch.Tens
             for layer_idx in range(num_layers):
                 if layer_idx >= first_k_dense_replace and layer_idx % moe_layer_freq == 0:
                     activation_freq[layer_idx, :] = 1.0
+            # yiqiliu2 / 2026-05-08: torch.topk on a uniform-1.0 tensor returns
+            # the FIRST k indices in flat layout — i.e. all indices come from
+            # layer 0. With kt-num-gpu-experts=4 (per-layer) and 43 MoE layers,
+            # we end up assigning 4*43=172 GPU expert slots all to layer 0
+            # instead of 4 per layer. Add jitter so torch.topk ties resolve
+            # uniformly across the (layer, expert) grid. Magnitude is small
+            # enough not to swamp real activation_freq when present.
+            mask = activation_freq > 0
+            jitter = torch.rand_like(activation_freq) * 1e-3
+            activation_freq = activation_freq + jitter * mask.float()
 
         # Generate masks on rank 0
         if tp_rank == 0:
