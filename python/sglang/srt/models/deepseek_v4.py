@@ -1678,8 +1678,36 @@ class DeepseekV4ForCausalLM(nn.Module):
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
+            # yiqiliu2 / 2026-05-07: when kt-num-gpu-experts == 0 we run
+            # all routed experts on the kt-kernel CPU path (which mmap-reads
+            # them from its own packed blob, file-backed, no anon swap-out
+            # of read-only data). The 158 GB of `mlp.experts.*` weights
+            # otherwise get copy_'d into the Parameter heap storage that
+            # sglang's mxfp4_deepseek.create_weights pre-allocated — and
+            # *that* is what swaps to disk under pressure ("expert是只读的
+            # 不用被写回"). Filter these names out of the iterator so the
+            # copy never happens; let the routed-expert Parameters stay
+            # untouched-anon (overcommit means no physical pages until
+            # written, which they won't be).
+            try:
+                _kt_num_gpu_experts = int(
+                    getattr(get_global_server_args(), "kt_num_gpu_experts", 0) or 0
+                )
+            except Exception:
+                _kt_num_gpu_experts = 0
+            _skip_routed_expert = (_kt_num_gpu_experts == 0)
+            import re as _re
+            _ROUTED_EXPERT_RE = _re.compile(
+                r"^(?:model\.)?layers\.\d+\.(?:mlp|ffn)\.experts\."
+                r"(?:\d+\.(?:w1|w2|w3|gate_proj|up_proj|down_proj)|"
+                r"w13_weight|w2_weight|w13_weight_scale_inv|w2_weight_scale_inv)"
+                r"(?:\.|$)"
+            )
+
             for name, loaded_weight in weights:
                 try:
+                    if _skip_routed_expert and _ROUTED_EXPERT_RE.match(name):
+                        continue
                     use_async_loading = should_async_load(loaded_weight)
 
                     name = self.remap_weight_name_to_dpsk_hf_format(
@@ -1910,6 +1938,17 @@ class DeepseekV4ForCausalLM(nn.Module):
         skipped_checking_patterns = ["attn_mqa.k_scale", "attn_mqa.v_scale"]
         if is_nextn:
             skipped_checking_patterns.extend(["lm_head", "embed_tokens"])
+        # yiqiliu2 / 2026-05-07: when running with kt-num-gpu-experts=0 we
+        # filtered the routed-expert names out of the load loop above; tell
+        # the sanity check those Parameters are intentionally unloaded
+        # (kt-kernel reads from its own mmap'd packed blob, no GPU work).
+        if _skip_routed_expert:
+            skipped_checking_patterns.extend([
+                "mlp.experts.w13_weight",
+                "mlp.experts.w2_weight",
+                "mlp.experts.w13_weight_scale_inv",
+                "mlp.experts.w2_weight_scale_inv",
+            ])
         unloaded_params = {
             p
             for p in unloaded_params

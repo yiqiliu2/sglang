@@ -288,6 +288,42 @@ class DeepSeekMxfp4MoEMethod:
             convert_v4_weights_to_triton_kernels is not None
             and (_force_tk or (not _force_trtllm and not _trtllm_fp4_supported()))
         )
+
+        # yiqiliu2 / 2026-05-07: when kt-num-gpu-experts=0 the kt_ep_wrapper
+        # does not place any routed experts on GPU, so the v4_triton_kernels
+        # swizzle that would normally run here is dead work — its output is
+        # never consulted at inference. Skipping it has two huge benefits on
+        # 88 GB host:
+        #   - eliminates the per-layer ~3 GB BF16 intermediate that
+        #     convert_v4_weights_to_triton_kernels allocates during the FP4
+        #     dequant -> swizzle -> requant pipeline (43 layers worth of
+        #     this is what just OOM'd us at layer 39)
+        #   - eliminates the safetensors page-cache pull for expert bytes;
+        #     kt-kernel CPU experts read from their own packed blob.
+        # The GPU still hosts attention + dense MLP, both of which load
+        # outside this method.
+        try:
+            _kt_num_gpu_experts = int(getattr(get_global_server_args(), "kt_num_gpu_experts", 0) or 0)
+        except Exception:
+            _kt_num_gpu_experts = 0
+        if _take_tk_path and _kt_num_gpu_experts == 0:
+            log_info_on_rank0(
+                logger,
+                f"[v4-triton-kernels] Skipping V4 MXFP4 swizzle (layer: "
+                f"{getattr(self, 'prefix', '?')}) — kt-num-gpu-experts=0, "
+                f"all routed experts run on the kt-kernel CPU path.",
+            )
+            # Drop the raw expert tensors to free safetensors mmap-backed
+            # pages right away. We won't need them again.
+            for _name in ("w13_weight", "w2_weight",
+                          "w13_weight_scale_inv", "w2_weight_scale_inv"):
+                if hasattr(layer, _name):
+                    delattr(layer, _name)
+            # Mark the layer with a stub so the apply() path knows there's
+            # no GPU expert work to do. _v4_tk_path stays unset so the
+            # standard "GPU MoE returns zeros" branch upstream covers it.
+            return
+
         if _take_tk_path:
             w13_raw = layer.w13_weight.data
             w2_raw = layer.w2_weight.data
@@ -309,6 +345,20 @@ class DeepSeekMxfp4MoEMethod:
             w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
                 w13_raw, w13_scale_raw, w2_raw, w2_scale_raw,
             )
+            # yiqiliu2 / 2026-05-07: capture (addr, nbytes) of each raw expert
+            # tensor BEFORE we drop the python references. They're zero-copy
+            # views of the safetensors mmap; calling MADV_DONTNEED on the
+            # underlying byte ranges after del lets the kernel reclaim those
+            # pages instead of letting them sit around as cold cache. On
+            # 88 GB host loading 158 GB of safetensors, this is the
+            # difference between a survivable boot and the kernel evicting
+            # sglang's anon RSS to swap.
+            _ranges = []
+            for _t in (w13_raw, w2_raw, w13_scale_raw, w2_scale_raw):
+                try:
+                    _ranges.append((int(_t.data_ptr()), int(_t.numel() * _t.element_size())))
+                except Exception:
+                    pass
             # Free raw tensors; the triton_kernels Tensor objects keep their
             # own swizzled storage. The kt_ep_wrapper's full-GPU prefill
             # fallback (kt_gpu_prefill_token_threshold > 0) needs the raw
@@ -323,6 +373,29 @@ class DeepSeekMxfp4MoEMethod:
                 del layer.w2_weight
                 del layer.w13_weight_scale_inv
                 del layer.w2_weight_scale_inv
+                # Tell the kernel: those mmap'd safetensors pages are dead
+                # weight (we already swizzled to GPU). Reclaim them now so
+                # the next layer's swizzle has page-cache headroom. Cheap
+                # syscall; failure is benign.
+                try:
+                    import ctypes as _ctypes
+                    _libc = _ctypes.CDLL("libc.so.6", use_errno=True)
+                    _MADV_DONTNEED = 4
+                    _PAGE = 4096
+                    for _addr, _nbytes in _ranges:
+                        if _addr == 0 or _nbytes <= 0:
+                            continue
+                        # madvise needs page-aligned start + length
+                        _aligned_start = _addr & ~(_PAGE - 1)
+                        _end = _addr + _nbytes
+                        _aligned_end = (_end + _PAGE - 1) & ~(_PAGE - 1)
+                        _libc.madvise(
+                            _ctypes.c_void_p(_aligned_start),
+                            _ctypes.c_size_t(_aligned_end - _aligned_start),
+                            _ctypes.c_int(_MADV_DONTNEED),
+                        )
+                except Exception:
+                    pass
             layer._v4_tk_w13 = w13_swiz
             layer._v4_tk_w13_pcg = w13_pcg
             layer._v4_tk_w2 = w2_swiz
