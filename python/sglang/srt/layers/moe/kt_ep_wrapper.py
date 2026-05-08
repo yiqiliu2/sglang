@@ -74,6 +74,38 @@ logger = logging.getLogger(__name__)
 _KT_GPU_EXPERTS_MASKS: Optional[torch.Tensor] = None
 
 
+def _kt_prefetch_packed_experts(layer_idx: int, topk_ids: torch.Tensor) -> None:
+    """Issue MADV_WILLNEED on the packed-blob byte ranges for the routed experts
+    that the gating just selected on this layer. Cheap, non-blocking syscall;
+    failure is benign (e.g., legacy SafeTensor loader path doesn't expose
+    prefetch_experts). yiqiliu2 / 2026-05-08.
+
+    Why: with MADV_RANDOM on the packed mmap, every cold expert read becomes a
+    4 KB page fault. A profiled 32-token decode pulled 4.3 GB at only 103 MB/s
+    — ~30× off Gen4 NVMe peak — because each fault is sequential and
+    synchronous on the AMX worker thread. WILLNEED queues kernel readahead
+    asynchronously, which then races the GPU's parallel attn + dense MLP work
+    on the same forward pass.
+    """
+    try:
+        from kt_kernel.utils.amx import NativeMoEWrapper
+
+        loader = getattr(NativeMoEWrapper, "_native_loader_instance", None)
+        if loader is None or not hasattr(loader, "prefetch_experts"):
+            return
+        # topk_ids is on GPU; pull to CPU once. Dedupe before issuing madvise
+        # so neighbouring duplicates collapse into one byte-range syscall.
+        unique_ids = torch.unique(topk_ids.flatten()).cpu().tolist()
+        # Filter out any sentinel IDs (e.g. -1 used by the GPU/CPU split path)
+        ids = [int(x) for x in unique_ids if x is not None and int(x) >= 0]
+        if not ids:
+            return
+        loader.prefetch_experts(layer_idx, ids)
+    except Exception:
+        # Prefetch is best-effort. Never let it break the forward pass.
+        pass
+
+
 @dataclass
 class KTConfig:
     """Configuration for KTransformers heterogeneous computing CPU part.
@@ -2410,6 +2442,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
 
+        # yiqiliu2 / 2026-05-08: prefetch this layer's routed experts from SSD
+        # via MADV_WILLNEED before the AMX kernel reads them. With MADV_RANDOM
+        # set on the packed-blob mmap, every cold expert read is a 4 KB page
+        # fault — measured 103 MB/s SSD bw on a Gen4 NVMe, ~30× off peak. The
+        # kernel handles WILLNEED asynchronously, so this overlaps SSD I/O
+        # with the GPU's attn + dense MLP compute on this layer.
+        _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
+
         # Submit forward task to CPU (non-blocking)
         self.wrapper.submit_forward(
             x, topk_ids, topk_weights, torch.cuda.current_stream(x.device).cuda_stream
@@ -2456,6 +2496,10 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         topk_output = dispatch_output.topk_output
         topk_weights, topk_ids, _ = topk_output
+
+        # See submit() above — prefetch routed-expert byte ranges before the
+        # AMX kernel touches them.
+        _kt_prefetch_packed_experts(self.kt_config.layer_idx, topk_ids)
 
         # Submit forward task using staged buffer
         self.wrapper.submit_forward(
