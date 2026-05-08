@@ -337,41 +337,32 @@ class DeepSeekMxfp4MoEMethod:
             hidden_size_tk = w13_raw.shape[2] * 2
             intermediate_size_tk = w2_raw.shape[2] * 2
 
-            # yiqiliu2 / 2026-05-08: P3.2 — slice GPU swizzle to only the first
-            # `_kt_num_gpu_experts` experts per layer when kt-num-gpu-experts > 0.
-            # The full-256-expert swizzle inflated GPU peak to ~26 GB (12 experts
-            # × 43 layers × ~50 MB BF16 intermediates) and OOM'd the 24 GB 4090.
-            # By slicing to e.g. 4 experts/layer we get 4 × 50 MB × 43 = 8.6 GB
-            # peak — fits with KV cache and workspace headroom.
+            # yiqiliu2 / 2026-05-08: kt_ep_wrapper.create_weights now sizes
+            # `w13_weight` to exactly the per-layer GPU expert count
+            # (`global_num_experts`, computed from the placement mask:
+            # K for uniform, variable for frequency). w13_raw arrives
+            # already correctly shaped [N_per_layer, ...]. So we should
+            # NOT slice further here — slicing [:K_global] truncated
+            # frequency placements with N_per_layer > K_global to K
+            # rows, but the kt_ep_wrapper expected N rows on the GPU
+            # side, causing illegal memory access. Use raw w13/w2 as-is.
             #
-            # The kt_ep_wrapper.mask_and_remap_expert_ids assigns logical IDs
-            # 0..N-1 to GPU index 0..N-1 (matching the slice), and -1 for CPU
-            # experts. So slicing the FIRST N experts is consistent with the
-            # default uniform-mask placement (or frequency-with-jitter-fallback).
+            # The legacy P3.2 slice (when w13_raw was full 256 experts)
+            # is now dead code on the kt-num-gpu-experts > 0 path.
             _full_num_experts = w13_raw.shape[0]
-            _slice_n = _kt_num_gpu_experts if _kt_num_gpu_experts > 0 else _full_num_experts
-            _slice_n = min(_slice_n, _full_num_experts)
-            if _slice_n < _full_num_experts:
-                w13_to_swizzle = w13_raw[:_slice_n].contiguous()
-                w2_to_swizzle = w2_raw[:_slice_n].contiguous()
-                w13_scale_to_swizzle = w13_scale_raw[:_slice_n].contiguous()
-                w2_scale_to_swizzle = w2_scale_raw[:_slice_n].contiguous()
-                log_info_on_rank0(
-                    logger,
-                    f'[v4-triton-kernels] Swizzling V4 MXFP4 (sliced to first '
-                    f'{_slice_n} of {_full_num_experts} experts; layer: {self.prefix})',
-                )
-            else:
-                w13_to_swizzle = w13_raw
-                w2_to_swizzle = w2_raw
-                w13_scale_to_swizzle = w13_scale_raw
-                w2_scale_to_swizzle = w2_scale_raw
-                log_info_on_rank0(
-                    logger,
-                    f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
-                    f'(layer: {self.prefix}, hidden_size={hidden_size_tk}, '
-                    f'intermediate_size={intermediate_size_tk})...',
-                )
+            w13_to_swizzle = w13_raw
+            w2_to_swizzle = w2_raw
+            w13_scale_to_swizzle = w13_scale_raw
+            w2_scale_to_swizzle = w2_scale_raw
+            log_info_on_rank0(
+                logger,
+                f'[v4-triton-kernels] Swizzling V4 MXFP4 weights for matmul_ogs '
+                f'(layer: {self.prefix}, num_experts={_full_num_experts}, '
+                f'hidden_size={hidden_size_tk}, '
+                f'intermediate_size={intermediate_size_tk})...',
+            )
+            _gpu_expert_ids = None
+            _slice_n = _full_num_experts
 
             w13_swiz, w13_pcg, w2_swiz, w2_pcg = convert_v4_weights_to_triton_kernels(
                 w13_to_swizzle, w13_scale_to_swizzle, w2_to_swizzle, w2_scale_to_swizzle,
@@ -432,10 +423,16 @@ class DeepSeekMxfp4MoEMethod:
             layer._v4_tk_w2 = w2_swiz
             layer._v4_tk_w2_pcg = w2_pcg
             layer._v4_tk_intermediate_size = intermediate_size_tk
-            # yiqiliu2 / 2026-05-08: report the SLICED count to downstream so
-            # the GPU MoE kernel matches the kt_ep_wrapper's mask_and_remap
-            # GPU index range (0..N-1).
-            layer._v4_tk_num_experts = _slice_n
+            # yiqiliu2 / 2026-05-08: report the actual swizzled count
+            # (= length of the GPU expert id list when mask-sliced, or
+            # the first-N slice count). This is what
+            # kt_ep_wrapper.mask_and_remap_expert_ids' GPU index range
+            # (0..N-1) must match.
+            if _gpu_expert_ids is not None:
+                layer._v4_tk_num_experts = len(_gpu_expert_ids)
+                layer._v4_tk_gpu_expert_ids = _gpu_expert_ids
+            else:
+                layer._v4_tk_num_experts = _slice_n
             layer._v4_tk_path = True
             return
 
