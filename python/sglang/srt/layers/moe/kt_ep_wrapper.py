@@ -200,6 +200,93 @@ def _kt_prefetch_packed_experts_async(layer_idx: int, topk_ids: torch.Tensor) ->
         pass
 
 
+_KT_ROUTING_TRACE_POOL = None
+_KT_ROUTING_TRACE_LOCK = None
+
+
+def _kt_get_routing_trace_pool():
+    global _KT_ROUTING_TRACE_POOL, _KT_ROUTING_TRACE_LOCK
+    if _KT_ROUTING_TRACE_POOL is None:
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        _KT_ROUTING_TRACE_POOL = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kt-routing-trace"
+        )
+        _KT_ROUTING_TRACE_LOCK = threading.Lock()
+    return _KT_ROUTING_TRACE_POOL
+
+
+def _kt_routing_trace_async(layer_idx: int, topk_ids: torch.Tensor) -> None:
+    """Phase 1 Stream A: per-token per-layer routed expert ids dump.
+    Background thread picks up via cuda event; never blocks scheduler.
+    yiqiliu2 / 2026-05-09."""
+    path = os.environ.get("KT_TRACE_ROUTING")
+    if not path:
+        return
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    try:
+        event = torch.cuda.Event()
+        event.record()
+        gpu_ids = topk_ids.detach()
+        pool = _kt_get_routing_trace_pool()
+        ts = time.perf_counter_ns()
+
+        def _do_dump():
+            try:
+                event.synchronize()
+                cpu_ids = gpu_ids.cpu()
+                ids = [int(x) for x in cpu_ids.flatten().tolist() if int(x) >= 0]
+                line = '{"t_ns":%d,"layer":%d,"ids":%s}\n' % (ts, layer_idx, ids)
+                with _KT_ROUTING_TRACE_LOCK:
+                    with open(path, "a") as f:
+                        f.write(line)
+            except Exception:
+                pass
+
+        try:
+            pool.submit(_do_dump)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _kt_prefetch_packed_experts_sync(layer_idx: int, topk_ids: torch.Tensor) -> None:
+    """Synchronous prefetch: pull topk_ids to CPU and block until the loader's
+    8-thread pread has fully populated the page cache for the routed experts'
+    byte ranges. yiqiliu2 / 2026-05-08 (1A).
+
+    Trade-off: this forces a GPU→CPU stream sync (topk_ids.cpu()) and parks
+    the scheduler thread for ~14 ms while pread runs. In return, the AMX
+    kernel that follows reads 100% from warm cache instead of single-threaded
+    mmap-faulting at ~100 MB/s. Net win for cold-tail decode on this rig
+    where 8-thread pread peaks at 5.58 GB/s (~40× mmap-fault bandwidth).
+
+    Skip during cuda graph capture (capture must not see CPU/host syncs).
+    """
+    try:
+        if torch.cuda.is_current_stream_capturing():
+            return
+    except Exception:
+        pass
+    try:
+        from kt_kernel.utils.amx import NativeMoEWrapper
+        loader = getattr(NativeMoEWrapper, "_native_loader_instance", None)
+        if loader is None or not hasattr(loader, "prefetch_experts_sync"):
+            return
+        cpu_ids = topk_ids.flatten().cpu()
+        ids = sorted({int(x) for x in cpu_ids.tolist() if int(x) >= 0})
+        if not ids:
+            return
+        loader.prefetch_experts_sync(layer_idx, ids)
+    except Exception:
+        pass
+
+
 def _kt_prefetch_packed_experts(layer_idx: int, topk_ids: torch.Tensor) -> None:
     """Issue MADV_WILLNEED on the packed-blob byte ranges for the routed experts
     that the gating just selected on this layer. Cheap, non-blocking syscall;
@@ -2587,14 +2674,20 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         _do_log = _kt_dbg_should_log(self.kt_config.layer_idx)
         if _do_log:
             t_pf0 = time.perf_counter()
-        # yiqiliu2 / 2026-05-08: prefetch hook is DISABLED. py-spy dump caught
-        # the scheduler in `torch.unique(topk_ids).cpu()` inside this function
-        # — a forced GPU→CPU stream synchronization called on every MoE layer
-        # (43×/token). With --disable-cuda-graph in effect, that sync was
-        # serialising decode at roughly 0.24 tok/s. Re-enable only after we
-        # have a non-blocking gating-id pull (e.g. async copy started after
-        # dispatch_output is built, polled later).
-        _kt_prefetch_packed_experts_async(self.kt_config.layer_idx, topk_ids)
+        # yiqiliu2 / 2026-05-08 (1A): KT_PREFETCH_SYNC=1 makes prefetch sync
+        # — block scheduler thread until 8-thread pread has warmed the cache
+        # for the routed experts BEFORE submitting AMX work. AMX then reads
+        # from warm cache instead of single-threaded mmap-faulting at ~100
+        # MB/s. Costs ~14 ms/layer of GPU stream sync + pread wait, saves
+        # the ~800 ms cumulative mmap-fault stall that the AMX kernel would
+        # otherwise pay on cold tail.
+        _prefetch_mode = os.environ.get("KT_PREFETCH_SYNC", "0")
+        if _prefetch_mode == "1":
+            _kt_prefetch_packed_experts_sync(self.kt_config.layer_idx, topk_ids)
+        else:
+            _kt_prefetch_packed_experts_async(self.kt_config.layer_idx, topk_ids)
+        # Phase 1 Stream A: routing trace (background thread, no scheduler stall)
+        _kt_routing_trace_async(self.kt_config.layer_idx, topk_ids)
         if _do_log:
             t_pf1 = time.perf_counter()
 
@@ -2671,6 +2764,8 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # have a non-blocking gating-id pull (e.g. async copy started after
         # dispatch_output is built, polled later).
         _kt_prefetch_packed_experts_async(self.kt_config.layer_idx, topk_ids)
+        # Phase 1 Stream A: routing trace on staged-input path too
+        _kt_routing_trace_async(self.kt_config.layer_idx, topk_ids)
         if _do_log:
             t_pf1 = time.perf_counter()
 

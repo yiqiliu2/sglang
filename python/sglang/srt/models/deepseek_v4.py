@@ -86,6 +86,91 @@ COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
+def _kt_fadvise_safetensors_donneed(model_dir: str):
+    """Phase 4.5: After model weights are on GPU, the safetensors page cache
+    residue is dead bytes — they consume page cache that should serve
+    packed.bin LRU. Call posix_fadvise(POSIX_FADV_DONTNEED) on every
+    safetensors file in the model dir to release. Idempotent.
+    yiqiliu2 / 2026-05-09."""
+    import os, ctypes, glob
+    if not model_dir or not os.path.isdir(model_dir):
+        return
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        POSIX_FADV_DONTNEED = 4
+        total_bytes = 0
+        for path in glob.glob(os.path.join(model_dir, "*.safetensors")):
+            try:
+                fd = os.open(path, os.O_RDONLY)
+                size = os.fstat(fd).st_size
+                rc = libc.posix_fadvise(
+                    ctypes.c_int(fd), ctypes.c_long(0), ctypes.c_long(0),
+                    ctypes.c_int(POSIX_FADV_DONTNEED))
+                os.close(fd)
+                if rc == 0:
+                    total_bytes += size
+            except Exception:
+                pass
+        logger.info(
+            f"[KT-Profile] fadvise(DONTNEED) released "
+            f"{total_bytes/1e9:.2f} GB of safetensors page cache residue")
+    except Exception as e:
+        logger.warning(f"[KT-Profile] fadvise failed: {e}")
+
+
+def _kt_dump_vram_param_breakdown(model):
+    """Phase 1 Stream F: dump model param size by category to a JSON file.
+    Categorizes torch parameters by name to track VRAM occupancy.
+    yiqiliu2 / 2026-05-09."""
+    path = os.environ.get("KT_TRACE_VRAM_PARAMS")
+    if not path:
+        return
+    cats = {
+        "input_embed": 0,
+        "lm_head": 0,
+        "attn": 0,
+        "dense_mlp": 0,
+        "shared_experts": 0,
+        "moe_experts": 0,
+        "norm": 0,
+        "other": 0,
+    }
+    detail = []
+    for name, p in model.named_parameters():
+        bytes_ = p.numel() * p.element_size()
+        on_cuda = p.is_cuda if hasattr(p, "is_cuda") else (p.device.type == "cuda")
+        if "embed_tokens" in name:
+            cats["input_embed"] += bytes_
+        elif "lm_head" in name:
+            cats["lm_head"] += bytes_
+        elif "self_attn" in name:
+            cats["attn"] += bytes_
+        elif "shared_experts" in name:
+            cats["shared_experts"] += bytes_
+        elif "experts" in name and "mlp" in name and "shared" not in name:
+            cats["moe_experts"] += bytes_
+        elif "mlp.gate_proj" in name or "mlp.up_proj" in name or "mlp.down_proj" in name:
+            cats["dense_mlp"] += bytes_
+        elif "norm" in name:
+            cats["norm"] += bytes_
+        else:
+            cats["other"] += bytes_
+        detail.append({"name": name, "bytes": bytes_, "cuda": bool(on_cuda),
+                        "shape": list(p.shape), "dtype": str(p.dtype)})
+    import json
+    payload = {"cats_gb": {k: round(v / 1e9, 4) for k, v in cats.items()},
+               "total_gb": round(sum(cats.values()) / 1e9, 4),
+               "n_params": len(detail),
+               "detail_first_50": detail[:50]}
+    try:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+        logger.info(f"[KT-Profile] VRAM param breakdown → {path}")
+    except Exception as e:
+        logger.warning(f"[KT-Profile] VRAM dump write failed: {e}")
+
+
+
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
         DeepseekV4BackendRadix,
@@ -1979,6 +2064,22 @@ class DeepseekV4ForCausalLM(nn.Module):
                 )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # Phase 1 Stream F: dump VRAM param breakdown (yiqiliu2 / 2026-05-09)
+        try:
+            _kt_dump_vram_param_breakdown(self)
+        except Exception as _e:
+            logger.warning(f"[KT-Profile] VRAM param dump failed: {_e}")
+        # Phase 4.5: release safetensors page cache residue (yiqiliu2 / 2026-05-09)
+        try:
+            _model_dir = os.environ.get("KT_MODEL_DIR")
+            if not _model_dir:
+                # Try common SGLang server arg path
+                _model_dir = (getattr(self.config, "_name_or_path", None)
+                              or getattr(self.config, "name_or_path", None))
+            if _model_dir:
+                _kt_fadvise_safetensors_donneed(_model_dir)
+        except Exception as _e:
+            logger.warning(f"[KT-Profile] fadvise hook failed: {_e}")
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
